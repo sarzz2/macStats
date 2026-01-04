@@ -8,6 +8,8 @@
     <string>com.sarzz.macstats</string>
     <key>CFBundleName</key>
     <string>MacStats</string>
+    <key>CFBundleIconFile</key>
+    <string>MacStats</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0.0</string>
     <key>CFBundleVersion</key>

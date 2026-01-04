@@ -34,6 +34,13 @@ fi
 # Copy Info.plist
 cp "Info.plist" "$APP_BUNDLE/Contents/"
 
+# Copy Icon
+if [ -f "MacStats.icns" ]; then
+    cp "MacStats.icns" "$APP_BUNDLE/Contents/Resources/"
+else
+    echo "⚠️ Warning: MacStats.icns not found"
+fi
+
 # Create PkgInfo
 echo "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
