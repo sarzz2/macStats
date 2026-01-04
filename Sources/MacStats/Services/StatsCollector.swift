@@ -56,13 +56,17 @@ class StatsCollector: ObservableObject {
     func startCollecting() {
         // Fast Stats (CPU, Mem, Network) - 2s
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.collectStats()
-            self?.collectDiskIO()
+            autoreleasepool {
+                self?.collectStats()
+                self?.collectDiskIO()
+            }
         }
         
         // GPU Stats - 4s (Throttled)
         Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
-            self?.collectGPUStats()
+            autoreleasepool {
+                self?.collectGPUStats()
+            }
         }
         
         // Slow Stats (Processes) - 5s
@@ -140,12 +144,14 @@ class StatsCollector: ObservableObject {
     
     func collectProcesses() {
         DispatchQueue.global(qos: .background).async {
-            let cpu = self.getTopProcesses(sortKey: "%cpu")
-            let mem = self.getTopProcesses(sortKey: "%mem")
-            
-            DispatchQueue.main.async {
-                self.topCpuProcesses = cpu
-                self.topMemProcesses = mem
+            autoreleasepool {
+                let cpu = self.getTopProcesses(sortKey: "%cpu")
+                let mem = self.getTopProcesses(sortKey: "%mem")
+                
+                DispatchQueue.main.async {
+                    self.topCpuProcesses = cpu
+                    self.topMemProcesses = mem
+                }
             }
         }
     }
@@ -434,16 +440,6 @@ class StatsCollector: ObservableObject {
 
     // Filter Logic in getTopProcesses (Modifying existing function)
     private func getTopProcesses(sortKey: String) -> [AppProcess] {
-        // ... (standard ps logic)
-        // ...
-        // We will modify existing implementation logic to include this check
-        // For simplicity, I'll rewrite the loop part here if I was replacing whole function.
-        // But since this is a partial replace tool, I'll just note the filter logic:
-        // let ignoreList = ["kernel_task", "launchd", "WindowServer", "loginwindow", "UserEventAgent", "gopls", "sourcekit-lsp"]
-        // if ignoreList.contains(where: { name.contains($0) }) { continue }
-        
-        // RE-IMPLEMENTING FULL FUNCTION BELOW FOR CLARITY IN REPLACEMENT
-        
         let task = Process()
         task.launchPath = "/bin/ps"
         var args = ["-Aceo", "pid,pcpu,pmem,comm"]
@@ -456,10 +452,23 @@ class StatsCollector: ObservableObject {
         
         let pipe = Pipe()
         task.standardOutput = pipe
-        task.launch()
         
+        do {
+            try task.run()
+        } catch {
+            return []
+        }
+        
+        // Safety timeout to prevent zombies if ps hangs
+        let sema = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in sema.signal() }
+        
+        // Wait up to 2 seconds
+        if sema.wait(timeout: .now() + 2) == .timedOut {
+            task.terminate()
+        }
+
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
         
         guard let output = String(data: data, encoding: .utf8) else { return [] }
         
@@ -481,8 +490,7 @@ class StatsCollector: ObservableObject {
                     let name = parts[3...].joined(separator: " ")
                     
                     // Filter Check
-                    // Filter out common background daemons if user wants just "Apps"
-                    // User said: "not include language_server etc. it should show antigravity, chrome etc."
+                    // Filter out common background daemons
                     let isBlocked = blocked.contains { name.lowercased().contains($0.lowercased()) }
                     if isBlocked { continue }
 
