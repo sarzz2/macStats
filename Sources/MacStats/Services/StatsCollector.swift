@@ -50,10 +50,15 @@ class StatsCollector: ObservableObject {
     }
     
     func startCollecting() {
+        // Fast Stats (CPU, Mem, Network, Disk Usage) - 2s
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.collectStats()
-            self?.collectProcesses()
             self?.collectDiskIO()
+        }
+        
+        // Slow Stats (Processes) - 5s
+        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.collectProcesses()
         }
     }
     

@@ -167,9 +167,6 @@ struct BidirectionalGraph: View {
     func formatBytes(_ val: Double) -> String {
         if val == 0 { return "0" }
         let b = Int64(val)
-        let f = ByteCountFormatter()
-        f.allowedUnits = [.useAll]
-        f.countStyle = .memory
-        return f.string(fromByteCount: b)
+        return Formatters.bytes.string(fromByteCount: b)
     }
 }

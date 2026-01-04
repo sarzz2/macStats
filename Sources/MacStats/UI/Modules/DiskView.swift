@@ -63,9 +63,6 @@ struct DiskView: View {
     
     func formatBytes(_ bytes: Double) -> String {
         let b = Int64(bytes)
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useAll]
-        formatter.countStyle = .memory
-        return formatter.string(fromByteCount: b)
+        return Formatters.bytes.string(fromByteCount: b)
     }
 }
