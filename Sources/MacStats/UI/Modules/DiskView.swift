@@ -5,13 +5,15 @@ struct DiskView: View {
     
     var body: some View {
         VStack(spacing: 12) {
-            Text("Disk Usage")
-                .font(.headline)
-            
-            Text("\(Int(stats.diskUsage * 100))%")
-                .font(.title2)
-                .bold()
-                .foregroundColor(.purple)
+            HStack {
+                Text("Disk Usage")
+                    .font(.headline)
+                Spacer()
+                Text("\(Int(stats.diskUsage * 100))%")
+                    .font(.headline)
+                    .bold()
+                    .foregroundColor(.purple)
+            }
             
             AdaptiveProgressBar(value: stats.diskUsage)
                  .frame(height: 12)

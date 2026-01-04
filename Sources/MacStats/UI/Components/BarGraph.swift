@@ -41,6 +41,12 @@ struct BarGraph: View {
                             .cornerRadius(4)
                             .position(x: min(max(hoverPos.x, 20), width - 20), y: 10)
                     }
+                    
+                    // Zero Line (Baseline)
+                    Rectangle()
+                        .fill(Color.secondary.opacity(0.3))
+                        .frame(height: 1)
+                        .padding(.bottom, -1) // Align perfectly at bottom
                 }
                 .contentShape(Rectangle())
                 .onHover { hovering in if !hovering { hoverValue = nil } }
@@ -92,11 +98,12 @@ struct BidirectionalGraph: View {
                 
                 ZStack {
                     // Center Line
+                    // Center Line (Zero Axis)
                     Path { p in
                         p.move(to: CGPoint(x: 0, y: midY))
                         p.addLine(to: CGPoint(x: geometry.size.width, y: midY))
                     }
-                    .stroke(Color.gray.opacity(0.3), style: StrokeStyle(lineWidth: 1, dash: [4]))
+                    .stroke(Color.secondary.opacity(0.5), style: StrokeStyle(lineWidth: 1)) // Solid line
                     
                     // Bars
                     HStack(spacing: 0) {

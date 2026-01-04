@@ -49,11 +49,20 @@ class StatsCollector: ObservableObject {
         startCollecting()
     }
     
+    // Disk State
+    private var lastDiskMB: Double?
+    private var lastDiskCheckTime: TimeInterval = 0
+
     func startCollecting() {
-        // Fast Stats (CPU, Mem, Network, Disk Usage) - 2s
+        // Fast Stats (CPU, Mem, Network) - 2s
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.collectStats()
             self?.collectDiskIO()
+        }
+        
+        // GPU Stats - 4s (Throttled)
+        Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
+            self?.collectGPUStats()
         }
         
         // Slow Stats (Processes) - 5s
@@ -67,17 +76,14 @@ class StatsCollector: ObservableObject {
         self.memoryUsage = getMemoryUsage() // Should update memoryDetails inside
         self.diskUsage = getDiskUsage()
         getNetworkUsage()
-        
-        collectGPUStats()
+        // GPU moved to separate timer
     }
     
     private func collectGPUStats() {
         // GPU Usage via ioreg (Device Utilization %)
         DispatchQueue.global(qos: .background).async {
             let task = Process()
-            // Fix: Use correct path /usr/sbin/ioreg and executableURL
             task.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
-            
             task.arguments = ["-c", "IOAccelerator", "-r", "-d", "1"]
             
             let pipe = Pipe()
@@ -87,7 +93,6 @@ class StatsCollector: ObservableObject {
                 try task.run()
                 task.waitUntilExit()
             } catch {
-                print("Failed to run ioreg: \(error)")
                 return
             }
             
@@ -102,7 +107,7 @@ class StatsCollector: ObservableObject {
                     usage = val / 100.0
                 }
             } else if let range = output.range(of: "\"Tiler Utilization %\"=(\\d+)", options: .regularExpression) {
-                 // Fallback for some AGX versions
+                 // Fallback
                  let match = String(output[range])
                  if let valStr = match.split(separator: "=").last, let val = Double(valStr) {
                      usage = val / 100.0
@@ -120,17 +125,13 @@ class StatsCollector: ObservableObject {
             @unknown default: baseTemp = 40.0
             }
             
-            // Add load heat
-            let realTemp = baseTemp + (usage * 30.0) // 40-70C normally
+            let realTemp = baseTemp + (usage * 30.0)
             
             DispatchQueue.main.async {
                 self.gpuUsage = usage
-                
-                // Smooth temp transition
                 let change = (realTemp - self.gpuTemp) * 0.2
                 self.gpuTemp = self.gpuTemp + change
                 
-                // History
                 self.gpuHistory.append(self.gpuUsage)
                 if self.gpuHistory.count > 30 { self.gpuHistory.removeFirst() }
             }
@@ -291,61 +292,55 @@ class StatsCollector: ObservableObject {
     
     func collectDiskIO() {
         DispatchQueue.global(qos: .background).async {
-            // iostat -d -c 2 -w 1 gets 2 samples, 1 sec apart. The first is "since boot", second is "current"
+            // iostat -Id: Instant Cumulative stats
+            // KB/t xfrs MB
+            // 22.55 4377790 96396.78
             let task = Process()
             task.launchPath = "/usr/sbin/iostat"
-            task.arguments = ["-d", "-c", "2", "-w", "1"]
+            task.arguments = ["-Id"]
             
             let pipe = Pipe()
             task.standardOutput = pipe
-            task.launch()
-            task.waitUntilExit()
+            
+            do {
+                try task.run()
+                task.waitUntilExit()
+            } catch { return }
             
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             guard let output = String(data: data, encoding: .utf8) else { return }
             
-            // Parse output.
-            // Format example:
-            // KB/t tps  MB/s
-            // 23.05 14  0.31
-            // ...
-            // We want the last line's MB/s if possible, or we need to look at specific columns.
-            // iostat output varies, but typically:
-            // disk0
-            // KB/t tps  MB/s
-            // ...
-            
             let lines = output.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: .newlines)
+            // Last line, last column = Total MB
             if let lastLine = lines.last {
                 let parts = lastLine.split(separator: " ", omittingEmptySubsequences: true)
-                // Assuming standard output where MB/s is often last or 3rd column depending on args.
-                // With `iostat -d` it's: KB/t tps  MB/s
-                // Wait, multiple disks show multiple columns. `iostat -d` sums them? No.
-                // Let's rely on `netstat` logic or similar diff if iostat is hard.
-                
-                // Better approach: simple parse of last number (MB/s) for the primary disk if possible.
-                // For MVP, if we get a double at the end, treat as MB/s total?
-                // `iostat -d` shows all disks.
-                
-                // Let's try to just parse the last Double in the output as "Activity"
-                if let speed = Double(parts.last ?? "") {
-                    DispatchQueue.main.async {
-                        // iostat reports MB/s
-                        // We might want to split Read/Write but iostat combines them in MB/s column usually unless -I used.
-                        // Let's separate Read/Write if we use `iostat -d -x`? No -x on mac.
-                        // macOS `iostat` is limited.
+                if let mbString = parts.last, let totalMB = Double(mbString) {
+                    
+                    let now = Date().timeIntervalSince1970
+                    
+                    if let lastMB = self.lastDiskMB, self.lastDiskCheckTime > 0 {
+                        let deltaMB = totalMB - lastMB
+                        let timeDiff = now - self.lastDiskCheckTime
                         
-                        // Fallback: Just show "Disk Activity" as one number for now.
-                        self.diskReadSpeed = speed * 1024 * 1024 // MB -> Bytes
-                        self.diskWriteSpeed = 0 // Combined
-                        
-                        // History
-                        self.diskReadHistory.append(self.diskReadSpeed)
-                        if self.diskReadHistory.count > 30 { self.diskReadHistory.removeFirst() }
-                        
-                        self.diskWriteHistory.append(self.diskWriteSpeed)
-                        if self.diskWriteHistory.count > 30 { self.diskWriteHistory.removeFirst() }
+                        if timeDiff > 0 && deltaMB >= 0 {
+                            let mbPerSec = deltaMB / timeDiff
+                            let bytesPerSec = mbPerSec * 1024 * 1024
+                            
+                            DispatchQueue.main.async {
+                                self.diskReadSpeed = bytesPerSec // Activity (as we only get total)
+                                self.diskWriteSpeed = 0
+                                
+                                self.diskReadHistory.append(self.diskReadSpeed)
+                                if self.diskReadHistory.count > 30 { self.diskReadHistory.removeFirst() }
+                                
+                                self.diskWriteHistory.append(0)
+                                if self.diskWriteHistory.count > 30 { self.diskWriteHistory.removeFirst() }
+                            }
+                        }
                     }
+                    
+                    self.lastDiskMB = totalMB
+                    self.lastDiskCheckTime = now
                 }
             }
         }
