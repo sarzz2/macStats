@@ -6,3 +6,16 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+
+# Build Artifacts
+*.app
+*.dmg
+*.pkg
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+
+# OS
+.Spotlight-V100
+.Trashes
