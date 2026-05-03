@@ -2,9 +2,10 @@
 
 A modern, highly interactive system monitor for macOS menu bar.
 
-<img width="332" height="382" alt="Screenshot 2026-01-04 at 7 47 00 PM" src="https://github.com/user-attachments/assets/4c76620f-8722-4163-9726-641df2182fa4" />
-<img width="364" height="364" alt="Screenshot 2026-01-04 at 7 47 15 PM" src="https://github.com/user-attachments/assets/996e6a02-f386-42ba-a119-c0314cbed50e" />
-<img width="302" height="670" alt="Screenshot 2026-01-04 at 7 47 30 PM" src="https://github.com/user-attachments/assets/43491f43-8968-4bcf-bad4-06664a86b37e" />
+<img width="299" height="791" alt="Screenshot 2026-05-03 at 9 33 03 PM" src="https://github.com/user-attachments/assets/fea5557a-e202-4321-b2e9-0ebd592ece0f" />
+<img width="325" height="652" alt="Screenshot 2026-05-03 at 9 32 46 PM" src="https://github.com/user-attachments/assets/a55f3993-67e1-4fc2-98ca-c82c0d4afa90" />
+<img width="320" height="616" alt="Screenshot 2026-05-03 at 9 32 18 PM" src="https://github.com/user-attachments/assets/f1333ef1-d685-46d2-858b-0d24ff94ef37" />
+
 
 ## Features
 
