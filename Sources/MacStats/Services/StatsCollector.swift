@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import Darwin
 import Cocoa
+import IOKit.ps
 
 class StatsCollector: ObservableObject {
     @Published var cpuUsage: Double = 0.0
@@ -9,14 +10,52 @@ class StatsCollector: ObservableObject {
     @Published var diskUsage: Double = 0.0
     @Published var networkUpload: Double = 0.0
     @Published var networkDownload: Double = 0.0
-    @Published var gpuUsage: Double = 0.0 // Placeholder for now
-    @Published var gpuTemp: Double = 0.0 // Simulated
-    
-    private var timer: Timer?
-    private var prevCpuInfo: processor_info_array_t?
-    @Published var prevCpuInfoCount: mach_msg_type_number_t = 0
-    
-    // Advanced Stats
+    @Published var gpuUsage: Double = 0.0
+    @Published var gpuTemp: Double = 0.0
+
+    // Battery
+    @Published var batteryLevel: Double = 1.0
+    @Published var batteryCharging: Bool = false
+    @Published var batteryTimeRemaining: String = "--"
+
+    // System
+    @Published var systemUptime: String = ""
+    @Published var cpuFrequencyMode: String = ""
+
+    // Memory extras
+    @Published var memoryPressure: String = "Normal"
+    @Published var swapUsed: Double = 0.0
+    @Published var swapTotal: Double = 0.0
+
+    // Disk details
+    @Published var diskReadSpeed: Double = 0.0
+    @Published var diskWriteSpeed: Double = 0.0
+    @Published var diskTotal: Int64 = 0
+    @Published var diskUsed: Int64 = 0
+
+    // Per-core + top processes
+    @Published var cpuPerCore: [Double] = []
+    @Published var topCpuProcesses: [AppProcess] = []
+    @Published var topMemProcesses: [AppProcess] = []
+
+    // --- Histories (60 points = 2 min at 2s intervals) ---
+    @Published var cpuHistory: [Double] = Array(repeating: 0.0, count: 60)
+    @Published var memHistory: [Double] = Array(repeating: 0.0, count: 60)
+    @Published var networkDownloadHistory: [Double] = Array(repeating: 0.0, count: 60)
+    @Published var networkUploadHistory: [Double] = Array(repeating: 0.0, count: 60)
+    @Published var diskReadHistory: [Double] = Array(repeating: 0.0, count: 60)
+    @Published var diskWriteHistory: [Double] = Array(repeating: 0.0, count: 60)
+    @Published var gpuHistory: [Double] = Array(repeating: 0.0, count: 60)
+
+    struct MemoryDetails {
+        var wired: Double
+        var active: Double
+        var compressed: Double
+        var free: Double
+        var total: Double
+    }
+    @Published var memoryDetails: MemoryDetails = MemoryDetails(wired: 0, active: 0, compressed: 0, free: 0, total: 0)
+
     struct AppProcess: Identifiable {
         let id = UUID()
         let pid: Int
@@ -24,130 +63,124 @@ class StatsCollector: ObservableObject {
         let usage: Double
         let icon: NSImage?
     }
-    
-    @Published var topCpuProcesses: [AppProcess] = []
-    @Published var topMemProcesses: [AppProcess] = []
-    @Published var cpuPerCore: [Double] = []
-    
-    // History for Graphs (stores last 30 data points)
-    @Published var networkDownloadHistory: [Double] = Array(repeating: 0.0, count: 30)
-    @Published var networkUploadHistory: [Double] = Array(repeating: 0.0, count: 30)
-    @Published var diskReadHistory: [Double] = Array(repeating: 0.0, count: 30)
-    @Published var diskWriteHistory: [Double] = Array(repeating: 0.0, count: 30)
-    @Published var gpuHistory: [Double] = Array(repeating: 0.0, count: 30)
-    
-    // Memory Details
-    struct MemoryDetails {
-        var wired: Double
-        var active: Double
-        var compressed: Double
-        var free: Double
-    }
-    @Published var memoryDetails: MemoryDetails = MemoryDetails(wired: 0, active: 0, compressed: 0, free: 0)
-    
+
+    // --- Cached IP (avoid repeated syscall) ---
+    private var cachedIP: String = ""
+    private var lastIPCheck: TimeInterval = 0
+
+    // --- Private state ---
+    private var prevCpuInfo: processor_info_array_t?
+    @Published var prevCpuInfoCount: mach_msg_type_number_t = 0
+    private var lastDiskMB: Double?
+    private var lastDiskCheckTime: TimeInterval = 0
+    private var lastNetworkInfo: (upload: UInt64, download: UInt64)?
+
+    // --- CRITICAL: Store timers as strong references on main RunLoop ---
+    private var fastTimer: Timer?   // 2s  — CPU, Mem, Network, Disk
+    private var gpuTimer: Timer?    // 8s  — GPU (ioreg process spawn, expensive)
+    private var slowTimer: Timer?   // 10s — Processes (ps spawn, expensive) + Swap
+    private var sysTimer: Timer?    // 15s — Battery, uptime, IP (cheapest)
+
     init() {
         startCollecting()
     }
-    
-    // Disk State
-    private var lastDiskMB: Double?
-    private var lastDiskCheckTime: TimeInterval = 0
 
     func startCollecting() {
-        // Fast Stats (CPU, Mem, Network) - 2s
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            autoreleasepool {
-                self?.collectStats()
-                self?.collectDiskIO()
-            }
+        // Fast: CPU, Memory, Network, Disk I/O
+        fastTimer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            autoreleasepool { self?.collectFastStats() }
         }
-        
-        // GPU Stats - 4s (Throttled)
-        Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
-            autoreleasepool {
-                self?.collectGPUStats()
-            }
+        RunLoop.main.add(fastTimer!, forMode: .common)
+
+        // GPU: spawn ioreg — throttled to save CPU
+        gpuTimer = Timer(timeInterval: 8.0, repeats: true) { [weak self] _ in
+            self?.collectGPUStats()
         }
-        
-        // Slow Stats (Processes) - 5s
-        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        RunLoop.main.add(gpuTimer!, forMode: .common)
+
+        // Slow: `ps` process listing + swap (heavier)
+        slowTimer = Timer(timeInterval: 10.0, repeats: true) { [weak self] _ in
             self?.collectProcesses()
+            self?.collectSwapInfo()
         }
+        RunLoop.main.add(slowTimer!, forMode: .common)
+
+        // System info: battery, uptime — very cheap, least frequent
+        sysTimer = Timer(timeInterval: 15.0, repeats: true) { [weak self] _ in
+            self?.collectBatteryInfo()
+            self?.collectSystemInfo()
+        }
+        RunLoop.main.add(sysTimer!, forMode: .common)
+
+        // Seed on launch (no disk history yet)
+        collectFastStats()
+        collectBatteryInfo()
+        collectSystemInfo()
+        collectSwapInfo()
     }
-    
-    func collectStats() {
-        self.cpuUsage = getCPUUsage() // Also updates cpuPerCore inside
-        self.memoryUsage = getMemoryUsage() // Should update memoryDetails inside
-        self.diskUsage = getDiskUsage()
+
+    // MARK: - Fast Stats (2s)
+    private func collectFastStats() {
+        cpuUsage = getCPUUsage()
+        memoryUsage = getMemoryUsage()
+        diskUsage = getDiskUsage()
         getNetworkUsage()
-        // GPU moved to separate timer
+        collectDiskIO()
+
+        // Append histories (on main — already here)
+        cpuHistory.append(cpuUsage)
+        if cpuHistory.count > 60 { cpuHistory.removeFirst() }
+        memHistory.append(memoryUsage)
+        if memHistory.count > 60 { memHistory.removeFirst() }
     }
-    
+
+    // MARK: - GPU (8s)
     private func collectGPUStats() {
-        // GPU Usage via ioreg (Device Utilization %)
-        DispatchQueue.global(qos: .background).async {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
             task.arguments = ["-c", "IOAccelerator", "-r", "-d", "1"]
-            
             let pipe = Pipe()
             task.standardOutput = pipe
-            
-            do {
-                try task.run()
-                task.waitUntilExit()
-            } catch {
-                return
-            }
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            
-            // Look for "Device Utilization %" = 16
+            task.standardError = Pipe()
+
+            do { try task.run(); task.waitUntilExit() } catch { return }
+
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
             var usage: Double = 0
-            if let range = output.range(of: "\"Device Utilization %\"=(\\d+)", options: .regularExpression) {
-                let match = String(output[range])
-                if let valStr = match.split(separator: "=").last, let val = Double(valStr) {
-                    usage = val / 100.0
+            let patterns = ["\"Device Utilization %\"=(\\d+)", "\"Tiler Utilization %\"=(\\d+)"]
+            for pattern in patterns {
+                if let range = output.range(of: pattern, options: .regularExpression) {
+                    if let val = Double(String(output[range]).split(separator: "=").last ?? "") {
+                        usage = val / 100.0
+                        break
+                    }
                 }
-            } else if let range = output.range(of: "\"Tiler Utilization %\"=(\\d+)", options: .regularExpression) {
-                 // Fallback
-                 let match = String(output[range])
-                 if let valStr = match.split(separator: "=").last, let val = Double(valStr) {
-                     usage = val / 100.0
-                 }
             }
-            
-            // Thermal State Baseline
+
             let state = ProcessInfo.processInfo.thermalState
-            var baseTemp: Double = 35.0
-            switch state {
-            case .nominal: baseTemp = 40.0
-            case .fair: baseTemp = 55.0
-            case .serious: baseTemp = 75.0
-            case .critical: baseTemp = 90.0
-            @unknown default: baseTemp = 40.0
-            }
-            
-            let realTemp = baseTemp + (usage * 30.0)
-            
+            let baseTemp: Double = state == .nominal ? 40 : state == .fair ? 55 : state == .serious ? 75 : 90
+            let target = baseTemp + (usage * 30.0)
+
             DispatchQueue.main.async {
                 self.gpuUsage = usage
-                let change = (realTemp - self.gpuTemp) * 0.2
-                self.gpuTemp = self.gpuTemp + change
-                
-                self.gpuHistory.append(self.gpuUsage)
-                if self.gpuHistory.count > 30 { self.gpuHistory.removeFirst() }
+                self.gpuTemp += (target - self.gpuTemp) * 0.2
+                self.gpuHistory.append(usage)
+                if self.gpuHistory.count > 60 { self.gpuHistory.removeFirst() }
             }
         }
     }
-    
+
+    // MARK: - Processes (10s)
     func collectProcesses() {
-        DispatchQueue.global(qos: .background).async {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
             autoreleasepool {
                 let cpu = self.getTopProcesses(sortKey: "%cpu")
                 let mem = self.getTopProcesses(sortKey: "%mem")
-                
                 DispatchQueue.main.async {
                     self.topCpuProcesses = cpu
                     self.topMemProcesses = mem
@@ -155,357 +188,262 @@ class StatsCollector: ObservableObject {
             }
         }
     }
-    
 
-    
-    // MARK: - CPU Usage
+    // MARK: - Swap (10s — lightweight sysctl)
+    func collectSwapInfo() {
+        var xswUsage = xsw_usage()
+        var size = MemoryLayout<xsw_usage>.size
+        if sysctlbyname("vm.swapusage", &xswUsage, &size, nil, 0) == 0 {
+            swapUsed = Double(xswUsage.xsu_used)
+            swapTotal = Double(xswUsage.xsu_total)
+        }
+    }
+
+    // MARK: - Battery (15s)
+    private func collectBatteryInfo() {
+        let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue()
+        let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef] ?? []
+        for source in sources {
+            guard let info = IOPSGetPowerSourceDescription(snapshot, source)?.takeUnretainedValue() as? [String: Any] else { continue }
+            if let cap = info[kIOPSCurrentCapacityKey] as? Int, let max = info[kIOPSMaxCapacityKey] as? Int, max > 0 {
+                batteryLevel = Double(cap) / Double(max)
+            }
+            batteryCharging = (info[kIOPSPowerSourceStateKey] as? String) == kIOPSACPowerValue
+            if let tte = info[kIOPSTimeToEmptyKey] as? Int, tte > 0 {
+                batteryTimeRemaining = tte >= 60 ? "\(tte/60)h \(tte%60)m" : "\(tte)m"
+            } else if let ttf = info[kIOPSTimeToFullChargeKey] as? Int, ttf > 0 {
+                batteryTimeRemaining = "~\(ttf >= 60 ? "\(ttf/60)h " : "")\(ttf%60)m to full"
+            } else {
+                batteryTimeRemaining = batteryCharging ? "Calculating..." : "--"
+            }
+        }
+    }
+
+    // MARK: - System Info (15s)
+    private func collectSystemInfo() {
+        let s = Int(ProcessInfo.processInfo.systemUptime)
+        let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
+        systemUptime = d > 0 ? "\(d)d \(h)h \(m)m" : h > 0 ? "\(h)h \(m)m" : "\(m)m"
+
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:  cpuFrequencyMode = "Performance"
+        case .fair:     cpuFrequencyMode = "Balanced"
+        case .serious:  cpuFrequencyMode = "Throttled"
+        case .critical: cpuFrequencyMode = "Critical"
+        @unknown default: cpuFrequencyMode = "Unknown"
+        }
+    }
+
+    // MARK: - CPU
     private func getCPUUsage() -> Double {
         let host = mach_host_self()
         var cpuInfo: processor_info_array_t!
         var cpuInfoCount: mach_msg_type_number_t = 0
         var numCPUs: mach_msg_type_number_t = 0
-        
-        // Host load info (alternative) - but per core is better for detailed
-        // Let's stick to overall first
-        
-        let result: kern_return_t = host_processor_info(host, PROCESSOR_CPU_LOAD_INFO, &numCPUs, &cpuInfo, &cpuInfoCount)
-        
-        guard result == KERN_SUCCESS else { return 0.0 }
-        
-        var totalUser: UInt32 = 0
-        var totalSystem: UInt32 = 0
-        var totalIdle: UInt32 = 0
-        var totalNice: UInt32 = 0
-        
+        guard host_processor_info(host, PROCESSOR_CPU_LOAD_INFO, &numCPUs, &cpuInfo, &cpuInfoCount) == KERN_SUCCESS else { return 0 }
+
+        var totalUser: UInt32 = 0, totalSystem: UInt32 = 0, totalNice: UInt32 = 0, totalIdle: UInt32 = 0
         var newPerCore: [Double] = []
-        
-        if let prevCpuInfo = prevCpuInfo {
+
+        if let prev = prevCpuInfo {
             for i in 0..<Int(numCPUs) {
                 let base = i * Int(CPU_STATE_MAX)
-                let user = cpuInfo[base + Int(CPU_STATE_USER)] - prevCpuInfo[base + Int(CPU_STATE_USER)]
-                let system = cpuInfo[base + Int(CPU_STATE_SYSTEM)] - prevCpuInfo[base + Int(CPU_STATE_SYSTEM)]
-                let nice = cpuInfo[base + Int(CPU_STATE_NICE)] - prevCpuInfo[base + Int(CPU_STATE_NICE)]
-                let idle = cpuInfo[base + Int(CPU_STATE_IDLE)] - prevCpuInfo[base + Int(CPU_STATE_IDLE)]
-                
-                let coreTotal = user + system + nice + idle
-                if coreTotal > 0 {
-                    let coreUsage = Double(user + system + nice) / Double(coreTotal)
-                    newPerCore.append(coreUsage)
-                } else {
-                    newPerCore.append(0.0)
-                }
-                
-                totalUser += UInt32(user)
-                totalSystem += UInt32(system)
-                totalNice += UInt32(nice)
-                totalIdle += UInt32(idle)
+                let u = cpuInfo[base + Int(CPU_STATE_USER)]   - prev[base + Int(CPU_STATE_USER)]
+                let s = cpuInfo[base + Int(CPU_STATE_SYSTEM)] - prev[base + Int(CPU_STATE_SYSTEM)]
+                let n = cpuInfo[base + Int(CPU_STATE_NICE)]   - prev[base + Int(CPU_STATE_NICE)]
+                let id = cpuInfo[base + Int(CPU_STATE_IDLE)]  - prev[base + Int(CPU_STATE_IDLE)]
+                let t = u + s + n + id
+                newPerCore.append(t > 0 ? Double(u + s + n) / Double(t) : 0)
+                totalUser += UInt32(u); totalSystem += UInt32(s); totalNice += UInt32(n); totalIdle += UInt32(id)
             }
         }
-        
-        DispatchQueue.main.async {
-            self.cpuPerCore = newPerCore
-        }
-        
-        // Update previous
-        // let prevSize = Int(cpuInfoCount) * MemoryLayout<integer_t>.stride
+        cpuPerCore = newPerCore
+
         let newPrev = UnsafeMutablePointer<integer_t>.allocate(capacity: Int(cpuInfoCount))
         newPrev.initialize(from: cpuInfo, count: Int(cpuInfoCount))
-        
-        if let prev = self.prevCpuInfo {
-            prev.deallocate()
-        }
-        self.prevCpuInfo = newPrev
-        self.prevCpuInfoCount = cpuInfoCount
-        
-        // Deallocate current info from kernel
-        let vmSize = Int(cpuInfoCount) * MemoryLayout<integer_t>.stride
-        vm_deallocate(mach_task_self_, vm_address_t(bitPattern: cpuInfo), vm_size_t(vmSize))
+        prevCpuInfo?.deallocate()
+        prevCpuInfo = newPrev
+        prevCpuInfoCount = cpuInfoCount
+
+        vm_deallocate(mach_task_self_, vm_address_t(bitPattern: cpuInfo), vm_size_t(Int(cpuInfoCount) * MemoryLayout<integer_t>.stride))
 
         let total = totalUser + totalSystem + totalNice + totalIdle
-        if total == 0 { return 0.0 }
-        
-        return Double(totalUser + totalSystem + totalNice) / Double(total)
+        return total == 0 ? 0 : Double(totalUser + totalSystem + totalNice) / Double(total)
     }
-    
-    // MARK: - Memory Usage
+
+    // MARK: - Memory
     private func getMemoryUsage() -> Double {
         var stats = vm_statistics64()
         var size = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.stride / MemoryLayout<integer_t>.stride)
-        let host = mach_host_self()
-        
         let result = withUnsafeMutablePointer(to: &stats) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(size)) {
-                host_statistics64(host, HOST_VM_INFO64, $0, &size)
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &size)
             }
         }
-        
-        if result == KERN_SUCCESS {
-            let pageSize = UInt64(vm_kernel_page_size)
-            let active = UInt64(stats.active_count) * pageSize
-            let wire = UInt64(stats.wire_count) * pageSize
-            // Approximate "Used" = Active + Wired (Compressed not included for simple % yet)
-            let compressed = UInt64(stats.compressor_page_count) * pageSize
-            let free = UInt64(stats.free_count) * pageSize
-            
-            // Physical memory
-            let physical = Double(ProcessInfo.processInfo.physicalMemory)
-            
-            let wiredBytes = Double(wire)
-            let activeBytes = Double(active)
-            let compressedBytes = Double(compressed)
-            let freeBytes = Double(free)
-            
-            DispatchQueue.main.async {
-                self.memoryDetails = MemoryDetails(
-                    wired: wiredBytes,
-                    active: activeBytes,
-                    compressed: compressedBytes,
-                    free: freeBytes
-                )
-            }
-            
-            let used = Double(active + wire + compressed)
-            return used / physical
-        }
-        return 0.0
+        guard result == KERN_SUCCESS else { return 0 }
+
+        let pg = UInt64(vm_kernel_page_size)
+        let active     = Double(UInt64(stats.active_count)     * pg)
+        let wired      = Double(UInt64(stats.wire_count)       * pg)
+        let compressed = Double(UInt64(stats.compressor_page_count) * pg)
+        let free       = Double(UInt64(stats.free_count)       * pg)
+        let physical   = Double(ProcessInfo.processInfo.physicalMemory)
+
+        memoryDetails = MemoryDetails(wired: wired, active: active, compressed: compressed, free: free, total: physical)
+        memoryPressure = (compressed / max(physical, 1)) > 0.3 ? "High" : (compressed / max(physical, 1)) > 0.15 ? "Medium" : "Normal"
+
+        return (active + wired + compressed) / physical
     }
-    
+
     // MARK: - Disk Usage
     private func getDiskUsage() -> Double {
         let url = URL(fileURLWithPath: "/")
-        do {
-            let values = try url.resourceValues(forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityKey])
-            if let total = values.volumeTotalCapacity, let available = values.volumeAvailableCapacity {
-                return 1.0 - (Double(available) / Double(total))
-            }
-        } catch {
-            print("Error reading disk usage: \(error)")
-        }
-        return 0.0
+        guard let vals = try? url.resourceValues(forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityKey]),
+              let total = vals.volumeTotalCapacity, let avail = vals.volumeAvailableCapacity else { return 0 }
+        diskTotal = Int64(total)
+        diskUsed  = Int64(total) - Int64(avail)
+        return 1.0 - Double(avail) / Double(total)
     }
-    
-    // MARK: - Disk IO
-    @Published var diskReadSpeed: Double = 0.0
-    @Published var diskWriteSpeed: Double = 0.0
-    
-    private var diskTask: Process?
-    private var diskPipe: Pipe?
-    
-    // We'll use a separate simplified approach for Disk IO:
-    // Parse `iostat -d -w 1` -> updates every second
-    // This requires a persistent background process or repeated calls.
-    // Repeated calls to `iostat -d -c 2 -w 1` (take 2nd sample) is cleaner for a periodic timer.
-    
-    func collectDiskIO() {
-        DispatchQueue.global(qos: .background).async {
-            // iostat -Id: Instant Cumulative stats
-            // KB/t xfrs MB
-            // 22.55 4377790 96396.78
+
+    // MARK: - Disk I/O
+    private func collectDiskIO() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
             let task = Process()
             task.launchPath = "/usr/sbin/iostat"
             task.arguments = ["-Id"]
-            
             let pipe = Pipe()
             task.standardOutput = pipe
-            
-            do {
-                try task.run()
-                task.waitUntilExit()
-            } catch { return }
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return }
-            
+            task.standardError = Pipe()
+            do { try task.run(); task.waitUntilExit() } catch { return }
+
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             let lines = output.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: .newlines)
-            // Last line, last column = Total MB
-            if let lastLine = lines.last {
-                let parts = lastLine.split(separator: " ", omittingEmptySubsequences: true)
-                if let mbString = parts.last, let totalMB = Double(mbString) {
-                    
-                    let now = Date().timeIntervalSince1970
-                    
-                    if let lastMB = self.lastDiskMB, self.lastDiskCheckTime > 0 {
-                        let deltaMB = totalMB - lastMB
-                        let timeDiff = now - self.lastDiskCheckTime
-                        
-                        if timeDiff > 0 && deltaMB >= 0 {
-                            let mbPerSec = deltaMB / timeDiff
-                            let bytesPerSec = mbPerSec * 1024 * 1024
-                            
-                            DispatchQueue.main.async {
-                                self.diskReadSpeed = bytesPerSec // Activity (as we only get total)
-                                self.diskWriteSpeed = 0
-                                
-                                self.diskReadHistory.append(self.diskReadSpeed)
-                                if self.diskReadHistory.count > 30 { self.diskReadHistory.removeFirst() }
-                                
-                                self.diskWriteHistory.append(0)
-                                if self.diskWriteHistory.count > 30 { self.diskWriteHistory.removeFirst() }
-                            }
-                        }
-                    }
-                    
-                    self.lastDiskMB = totalMB
-                    self.lastDiskCheckTime = now
+            guard let last = lines.last,
+                  let mb = Double(last.split(separator: " ", omittingEmptySubsequences: true).last ?? "") else { return }
+
+            let now = Date().timeIntervalSince1970
+            if let prev = self.lastDiskMB, self.lastDiskCheckTime > 0 {
+                let dt = now - self.lastDiskCheckTime
+                let bytesPerSec = dt > 0 ? max(0, (mb - prev) / dt) * 1_048_576 : 0
+                DispatchQueue.main.async {
+                    self.diskReadSpeed = bytesPerSec
+                    self.diskReadHistory.append(bytesPerSec)
+                    if self.diskReadHistory.count > 60 { self.diskReadHistory.removeFirst() }
+                    self.diskWriteHistory.append(0)
+                    if self.diskWriteHistory.count > 60 { self.diskWriteHistory.removeFirst() }
                 }
             }
+            self.lastDiskMB = mb
+            self.lastDiskCheckTime = now
         }
     }
-    private var lastNetworkInfo: (upload: UInt64, download: UInt64)?
-    
-    // Helper types for network
-    struct NetworkInfo {
-        var upload: UInt64
-        var download: UInt64
-    }
-    
+
+    // MARK: - Network
     private func getNetworkUsage() {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return }
-        
-        var totalUpload: UInt64 = 0
-        var totalDownload: UInt64 = 0
-        
+        defer { freeifaddrs(ifaddr) }
+
+        var up: UInt64 = 0, down: UInt64 = 0
         var ptr = ifaddr
         while ptr != nil {
             defer { ptr = ptr?.pointee.ifa_next }
-            
-            guard let interface = ptr?.pointee else { continue }
-            // let name = String(cString: interface.ifa_name)
-            
-            // Filter loopback and non-active
-            guard (interface.ifa_flags & UInt32(IFF_LOOPBACK)) == 0 else { continue }
-            guard (interface.ifa_flags & UInt32(IFF_UP)) != 0 else { continue }
-            guard (interface.ifa_flags & UInt32(IFF_RUNNING)) != 0 else { continue }
-            
-            // We care about link layer data (AF_LINK) to get bytes
-            if interface.ifa_addr.pointee.sa_family == UInt8(AF_LINK) {
-                if let data = interface.ifa_data?.assumingMemoryBound(to: if_data.self) {
-                    totalDownload += UInt64(data.pointee.ifi_ibytes)
-                    totalUpload += UInt64(data.pointee.ifi_obytes)
-                }
-            }
+            guard let iface = ptr?.pointee,
+                  (iface.ifa_flags & UInt32(IFF_LOOPBACK)) == 0,
+                  (iface.ifa_flags & UInt32(IFF_UP)) != 0,
+                  (iface.ifa_flags & UInt32(IFF_RUNNING)) != 0,
+                  iface.ifa_addr.pointee.sa_family == UInt8(AF_LINK),
+                  let data = iface.ifa_data?.assumingMemoryBound(to: if_data.self) else { continue }
+            down += UInt64(data.pointee.ifi_ibytes)
+            up   += UInt64(data.pointee.ifi_obytes)
         }
-        
-        freeifaddrs(ifaddr)
-        
+
         if let last = lastNetworkInfo {
-            // Bytes per second (since timer is 1s)
-            DispatchQueue.main.async {
-                self.networkUpload = Double(totalUpload - last.upload)
-                self.networkDownload = Double(totalDownload - last.download)
-                
-                // Update History
-                self.networkDownloadHistory.append(self.networkDownload)
-                if self.networkDownloadHistory.count > 30 { self.networkDownloadHistory.removeFirst() }
-                
-                self.networkUploadHistory.append(self.networkUpload)
-                if self.networkUploadHistory.count > 30 { self.networkUploadHistory.removeFirst() }
-            }
+            networkUpload   = Double(up - last.upload)
+            networkDownload = Double(down - last.download)
+            networkDownloadHistory.append(networkDownload)
+            if networkDownloadHistory.count > 60 { networkDownloadHistory.removeFirst() }
+            networkUploadHistory.append(networkUpload)
+            if networkUploadHistory.count > 60 { networkUploadHistory.removeFirst() }
         }
-        
-        lastNetworkInfo = (upload: totalUpload, download: totalDownload)
-    }
-    
-    // MARK: - Network IP
-    func getLocalIP() -> String {
-        var address: String?
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        
-        if getifaddrs(&ifaddr) == 0 {
-            var ptr = ifaddr
-            while ptr != nil {
-                defer { ptr = ptr?.pointee.ifa_next }
-                
-                guard let interface = ptr?.pointee else { continue }
-                let addrFamily = interface.ifa_addr.pointee.sa_family
-                
-                // Check for IPv4
-                if addrFamily == UInt8(AF_INET) {
-                    let name = String(cString: interface.ifa_name)
-                    // Prefer en0 (Wi-Fi usually)
-                    if name == "en0" {
-                        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                        getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                                    &hostname, socklen_t(hostname.count),
-                                    nil, socklen_t(0), NI_NUMERICHOST)
-                        address = String(cString: hostname)
-                    }
-                }
-            }
-            freeifaddrs(ifaddr)
-        }
-        return address ?? "Unknown"
+        lastNetworkInfo = (up, down)
     }
 
-    // Filter Logic in getTopProcesses (Modifying existing function)
+    // MARK: - Local IP (cached — avoids repeated syscall on every render)
+    func getLocalIP() -> String {
+        let now = Date().timeIntervalSince1970
+        if !cachedIP.isEmpty && now - lastIPCheck < 30 { return cachedIP }
+
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return cachedIP.isEmpty ? "Unknown" : cachedIP }
+        defer { freeifaddrs(ifaddr) }
+
+        var ptr = ifaddr
+        while ptr != nil {
+            defer { ptr = ptr?.pointee.ifa_next }
+            guard let iface = ptr?.pointee,
+                  iface.ifa_addr.pointee.sa_family == UInt8(AF_INET),
+                  String(cString: iface.ifa_name) == "en0" else { continue }
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(iface.ifa_addr, socklen_t(iface.ifa_addr.pointee.sa_len),
+                        &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+            cachedIP = String(cString: hostname)
+            break
+        }
+        lastIPCheck = now
+        return cachedIP.isEmpty ? "Unknown" : cachedIP
+    }
+
+    // MARK: - Top Processes
     private func getTopProcesses(sortKey: String) -> [AppProcess] {
         let task = Process()
         task.launchPath = "/bin/ps"
-        var args = ["-Aceo", "pid,pcpu,pmem,comm"]
-        if sortKey == "%mem" {
-            args = ["-Amceo", "pid,pcpu,pmem,comm"]
-        } else {
-            args = ["-Arceo", "pid,pcpu,pmem,comm"]
-        }
-        task.arguments = args
-        
+        // Parse more candidates since we'll filter strictly — use pid,pcpu,pmem only (no comm needed)
+        task.arguments = sortKey == "%mem" ? ["-Amco", "pid,pcpu,pmem"] : ["-Arco", "pid,pcpu,pmem"]
         let pipe = Pipe()
         task.standardOutput = pipe
-        
-        do {
-            try task.run()
-        } catch {
-            return []
-        }
-        
-        // Safety timeout to prevent zombies if ps hangs
+        task.standardError = Pipe()
+        do { try task.run() } catch { return [] }
+
         let sema = DispatchSemaphore(value: 0)
         task.terminationHandler = { _ in sema.signal() }
-        
-        // Wait up to 2 seconds
-        if sema.wait(timeout: .now() + 2) == .timedOut {
-            task.terminate()
-        }
+        if sema.wait(timeout: .now() + 3) == .timedOut { task.terminate() }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
-        
-        var processes: [AppProcess] = []
-        let lines = output.components(separatedBy: .newlines).dropFirst()
-        
-        // Filter blocked names
-        let blocked = ["kernel_task", "launchd", "WindowServer", "loginwindow", "UserEventAgent", "gopls", "sourcekit-lsp", "language_server", "biometrickitd", "controlcenter"]
-        
-        for line in lines {
-            if processes.count >= 5 { break } // Limit 5
-            
+        guard let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) else { return [] }
+
+        // Get all running .regular apps once — these are exactly the apps shown in Dock/App Switcher.
+        // Helpers, renderers, daemons all have .accessory or .prohibited policy and are excluded automatically.
+        let regularApps = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular
+        }
+        let regularPIDs = Dictionary(uniqueKeysWithValues: regularApps.map { (Int($0.processIdentifier), $0) })
+
+        var results: [AppProcess] = []
+        var seen = Set<Int>() // deduplicate by PID (ps may list same pid across threads)
+
+        for line in output.components(separatedBy: .newlines).dropFirst() {
+            if results.count >= 5 { break }
             let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-            if parts.count >= 4 {
-                if let pid = Int(parts[0]),
-                   let cpu = Double(parts[1]),
-                   let _ = Double(parts[2]) {
-                    
-                    let name = parts[3...].joined(separator: " ")
-                    
-                    // Filter Check
-                    // Filter out common background daemons
-                    let isBlocked = blocked.contains { name.lowercased().contains($0.lowercased()) }
-                    if isBlocked { continue }
+            guard parts.count >= 3,
+                  let pid = Int(parts[0]),
+                  let cpu = Double(parts[1]),
+                  let mem = Double(parts[2]),
+                  !seen.contains(pid),
+                  let app = regularPIDs[pid] else { continue }
 
-                    // Friendly Name
-                    let app = NSRunningApplication(processIdentifier: pid_t(pid))
-                    let icon = app?.icon
-                    let friendlyName = app?.localizedName ?? name
-                    
-                    if friendlyName == "arm64" || friendlyName == "x86_64" { continue }
-
-                    let usageVal = (sortKey == "%mem") ? Double(parts[2]) ?? 0 : cpu
-                    processes.append(AppProcess(pid: pid, name: friendlyName, usage: usageVal, icon: icon))
-                }
-            }
+            seen.insert(pid)
+            let val = sortKey == "%mem" ? mem : cpu
+            results.append(AppProcess(pid: pid, name: app.localizedName ?? "Unknown", usage: val, icon: app.icon))
         }
-        return processes
+        return results
+    }
+
+    deinit {
+        fastTimer?.invalidate()
+        gpuTimer?.invalidate()
+        slowTimer?.invalidate()
+        sysTimer?.invalidate()
+        prevCpuInfo?.deallocate()
     }
 }

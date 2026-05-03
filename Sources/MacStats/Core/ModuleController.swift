@@ -6,8 +6,12 @@ class ModuleController: NSObject, NSPopoverDelegate {
     var popover: NSPopover
     var updateClosure: (NSButton) -> Void
     var iconName: String
-    
-    init(title: String, iconName: String, view: AnyView, width: CGFloat? = nil, updateClosure: @escaping (NSButton) -> Void) {
+
+    // Update interval kept at 2s (matches fast timer) but uses the already-computed published values
+    // so no extra computation happens here — just a UI refresh.
+    private var uiTimer: Timer?
+
+    init(title: String, iconName: String, view: AnyView, popoverHeight: CGFloat = 300, width: CGFloat? = nil, updateClosure: @escaping (NSButton) -> Void) {
         if let w = width {
             self.statusItem = NSStatusBar.system.statusItem(withLength: w)
         } else {
@@ -17,18 +21,19 @@ class ModuleController: NSObject, NSPopoverDelegate {
         self.updateClosure = updateClosure
         self.iconName = iconName
         super.init()
-        
+
         self.popover.delegate = self
-        
+
         setupStatusItem()
-        setupPopover(view: view)
-        
-        // Start update timer
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        setupPopover(view: view, height: popoverHeight)
+
+        // UI refresh timer — stored as strong reference on main RunLoop
+        uiTimer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.updateUI()
         }
+        RunLoop.main.add(uiTimer!, forMode: .common)
     }
-    
+
     private func setupStatusItem() {
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: iconName, accessibilityDescription: nil)
@@ -38,46 +43,41 @@ class ModuleController: NSObject, NSPopoverDelegate {
         }
         updateUI()
     }
-    
-    private func setupPopover(view: AnyView) {
+
+    private func setupPopover(view: AnyView, height: CGFloat) {
         popover.behavior = .transient
-        // Wrap in a sizing controller
         let controller = NSHostingController(rootView: view)
-        controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: 300)
+        controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: height)
         popover.contentViewController = controller
-        // popover.appearance = nil // Default to system theme
     }
-    
+
     @objc func updateUI() {
         if let button = statusItem.button {
             updateClosure(button)
         }
     }
-    
+
     private var eventMonitor: Any?
-    
+
     @objc func togglePopover(_ sender: AnyObject?) {
-        if statusItem.button != nil {
-            if popover.isShown {
-                closePopover(sender)
-            } else {
-                showPopover(sender)
-            }
+        guard statusItem.button != nil else { return }
+        if popover.isShown {
+            closePopover(sender)
+        } else {
+            showPopover(sender)
         }
     }
-    
+
     func showPopover(_ sender: AnyObject?) {
         if let button = statusItem.button {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             button.highlight(true)
-            
-            // Monitor clicks outside
-            eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
                 self?.closePopover(sender)
             }
         }
     }
-    
+
     func closePopover(_ sender: AnyObject?) {
         popover.performClose(sender)
         statusItem.button?.highlight(false)
@@ -86,7 +86,7 @@ class ModuleController: NSObject, NSPopoverDelegate {
             eventMonitor = nil
         }
     }
-    
+
     // MARK: - NSPopoverDelegate
     func popoverDidClose(_ notification: Notification) {
         statusItem.button?.highlight(false)
@@ -95,8 +95,12 @@ class ModuleController: NSObject, NSPopoverDelegate {
             eventMonitor = nil
         }
     }
-    
+
     func popoverWillShow(_ notification: Notification) {
         statusItem.button?.highlight(true)
+    }
+
+    deinit {
+        uiTimer?.invalidate()
     }
 }
