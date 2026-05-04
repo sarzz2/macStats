@@ -83,6 +83,7 @@ class StatsCollector: ObservableObject {
 
     init() {
         startCollecting()
+        registerSleepWakeNotifications()
     }
 
     func startCollecting() {
@@ -117,6 +118,46 @@ class StatsCollector: ObservableObject {
         collectBatteryInfo()
         collectSystemInfo()
         collectSwapInfo()
+    }
+
+    // MARK: - Sleep / Wake
+    private func registerSleepWakeNotifications() {
+        // Tell macOS this process must not be auto-terminated.
+        // Doing it programmatically is more reliable than Info.plist alone for LSUIElement agents.
+        ProcessInfo.processInfo.disableAutomaticTermination("MacStats monitoring")
+
+        let wsnc = NSWorkspace.shared.notificationCenter
+        // Stop collection BEFORE sleep so no background ioreg/iostat process
+        // gets interrupted mid-execution (which causes a crash on wake).
+        wsnc.addObserver(self, selector: #selector(handleWillSleep),
+                         name: NSWorkspace.willSleepNotification, object: nil)
+        wsnc.addObserver(self, selector: #selector(handleWake),
+                         name: NSWorkspace.didWakeNotification, object: nil)
+    }
+
+    @objc private func handleWillSleep() {
+        // Invalidate all timers before sleep. This ensures no spawned subprocess
+        // (ioreg, iostat, ps) is in-flight when the system suspends — those would
+        // be killed by the OS and their pipe reads would throw, crashing the app.
+        fastTimer?.invalidate(); fastTimer = nil
+        gpuTimer?.invalidate();  gpuTimer = nil
+        slowTimer?.invalidate(); slowTimer = nil
+        sysTimer?.invalidate();  sysTimer = nil
+    }
+
+    @objc private func handleWake() {
+        // Reset delta-based baselines — CPU/network/disk counters advanced
+        // during sleep so the first sample after wake would show a false spike.
+        prevCpuInfo?.deallocate()
+        prevCpuInfo = nil
+        prevCpuInfoCount = 0
+        lastNetworkInfo = nil
+        lastDiskMB = nil
+        lastDiskCheckTime = 0
+        lastIPCheck = 0   // IP may have changed after reconnecting
+
+        // Restart all timers fresh (startCollecting creates new timers)
+        startCollecting()
     }
 
     // MARK: - Fast Stats (2s)
