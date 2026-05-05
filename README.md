@@ -2,6 +2,8 @@
 
 A modern, highly interactive system monitor for macOS menu bar.
 
+Download Now https://macstats.qzz.io/
+
 <img width="299" height="791" alt="Screenshot 2026-05-03 at 9 33 03 PM" src="https://github.com/user-attachments/assets/fea5557a-e202-4321-b2e9-0ebd592ece0f" />
 <img width="325" height="652" alt="Screenshot 2026-05-03 at 9 32 46 PM" src="https://github.com/user-attachments/assets/a55f3993-67e1-4fc2-98ca-c82c0d4afa90" />
 <img width="320" height="616" alt="Screenshot 2026-05-03 at 9 32 18 PM" src="https://github.com/user-attachments/assets/f1333ef1-d685-46d2-858b-0d24ff94ef37" />
